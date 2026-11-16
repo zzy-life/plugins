@@ -911,42 +911,48 @@ test("上一 prompt 已把缓存比例校准为 0 时，下一回合工具步不
   })
 })
 
-test("LRU 淘汰后，补默认字段的 follow-up 仍能 resume 原 session", async () => {
-  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" }, sessionResume: true }, async (kit) => {
-    let sessionA
+test("每个请求新开 session，带默认字段的 follow-up 重放历史", async () => {
+  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" } }, async (kit) => {
+    let replay = ""
     kit.prompts.push(async (agent) => {
-      sessionA = agent.sessionId
       await agent.tool("Edit", { path: "/f", old_string: "a", new_string: "b" })
       await agent.text("edited")
       return { stopReason: "end_turn", usage: { inputTokens: 4000, outputTokens: 5 } }
+    })
+    // 工具结果请求：新进程、新 session，只看到重放的历史
+    kit.prompts.push(async (agent) => {
+      await agent.text("after tool")
+      return { stopReason: "end_turn", usage: { inputTokens: 4100, outputTokens: 2 } }
     })
     kit.prompts.push(async (agent) => {
       await agent.text("filler")
       return { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 1 } }
     })
     kit.prompts.push(async (agent) => {
-      await agent.text("resumed")
-      return { stopReason: "end_turn", usage: { inputTokens: 4100, cachedReadTokens: 3000, outputTokens: 3 } }
+      replay = agent.prompt.map((part) => (part.type === "text" ? part.text : "")).join("")
+      await agent.text("continued")
+      return { stopReason: "end_turn", usage: { inputTokens: 4200, outputTokens: 3 } }
     })
     const bodyA = baseBody({ messages: [{ role: "user", content: "please edit conversation A" }], tools: editTool() })
     const first = await runTurn(kit, bodyA)
-    assert.ok(sessionA, "未记下会话 A 的 sessionId")
-    assert.equal(kit.acpSpawns.length, 1)
+    assert.equal(first.responses[0].stopReason, "tool_use")
+    assert.equal(first.responses[1].stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 2, "工具结果请求也应有自己的进程")
 
     const bodyB = baseBody({ messages: [{ role: "user", content: "unrelated filler conversation B" }] })
     const filler = await runTurn(kit, bodyB)
     assert.equal(filler.responses[0].stopReason, "end_turn")
-    assert.equal(kit.acpSpawns.length, 2, "第二会话应挤掉会话 A")
 
     const { followMessages, mutated } = followUpAfter(first, "thanks, continue", { fillDefaults: true })
     assert.ok(mutated >= 1)
     const second = await runTurn(kit, { ...bodyA, messages: followMessages })
     assert.equal(second.responses[0].stopReason, "end_turn")
     const resumes = kit.acpLog.filter((item) => item.method === "session/resume")
-    assert.equal(resumes.length, 1, "补默认字段后应 session/resume，而不是新开 session")
-    assert.equal(resumes[0].params.sessionId, sessionA)
+    assert.equal(resumes.length, 0, "不得恢复任何历史会话")
     const news = kit.acpLog.filter((item) => item.method === "session/new")
-    assert.equal(news.length, 2, "只有 A 的首回合与 filler B 应 session/new")
+    assert.equal(news.length, 4, "每个请求都应 session/new")
+    assert.ok(replay.includes("please edit conversation A"), `新会话应重放历史: ${JSON.stringify(replay)}`)
+    assert.ok(replay.includes("thanks, continue"), `新会话应带上新的一轮: ${JSON.stringify(replay)}`)
   })
 })
 
@@ -995,14 +1001,16 @@ test("取消 prompt 把缓存比例校准为 0 后，下一回合工具步也不
   })
 })
 
-test("LRU 淘汰后，改写历史 tool_use id 的 follow-up 不得 session/resume", async () => {
-  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" }, sessionResume: true }, async (kit) => {
-    let sessionA
+test("改写历史 tool_use id 的 follow-up 同样新开 session", async () => {
+  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" } }, async (kit) => {
     kit.prompts.push(async (agent) => {
-      sessionA = agent.sessionId
       await agent.tool("Edit", { path: "/f", old_string: "a", new_string: "b" })
       await agent.text("edited")
       return { stopReason: "end_turn", usage: { inputTokens: 4000, outputTokens: 5 } }
+    })
+    kit.prompts.push(async (agent) => {
+      await agent.text("after tool")
+      return { stopReason: "end_turn", usage: { inputTokens: 4100, outputTokens: 2 } }
     })
     kit.prompts.push(async (agent) => {
       await agent.text("filler")
@@ -1010,23 +1018,22 @@ test("LRU 淘汰后，改写历史 tool_use id 的 follow-up 不得 session/resu
     })
     kit.prompts.push(async (agent) => {
       await agent.text("fresh")
-      return { stopReason: "end_turn", usage: { inputTokens: 4100, outputTokens: 3 } }
+      return { stopReason: "end_turn", usage: { inputTokens: 4200, outputTokens: 3 } }
     })
     const bodyA = baseBody({ messages: [{ role: "user", content: "please edit conversation A" }], tools: editTool() })
     const first = await runTurn(kit, bodyA)
-    assert.ok(sessionA)
     const bodyB = baseBody({ messages: [{ role: "user", content: "unrelated filler conversation B" }] })
     await runTurn(kit, bodyB)
-    assert.equal(kit.acpSpawns.length, 2)
+    assert.equal(kit.acpSpawns.length, 3)
 
     const { followMessages, mutated } = followUpAfter(first, "thanks, continue", { fillDefaults: true, rewriteIds: true })
     assert.ok(mutated >= 2)
     const second = await runTurn(kit, { ...bodyA, messages: followMessages })
     assert.equal(second.responses[0].stopReason, "end_turn")
     const resumes = kit.acpLog.filter((item) => item.method === "session/resume")
-    assert.equal(resumes.length, 0, "改写 tool_use id 后不应 resume 已淘汰会话")
+    assert.equal(resumes.length, 0, "不得恢复任何历史会话")
     const news = kit.acpLog.filter((item) => item.method === "session/new")
-    assert.equal(news.length, 3, "应新开 session，而不是 resume 会话 A")
+    assert.equal(news.length, 4, "每个请求都应 session/new")
   })
 })
 

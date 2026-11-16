@@ -11,11 +11,10 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-convkey-test-"))
 const entry = new URL("../index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-process.env.AGY_BRIDGE_STATE_FILE = path.join(workspace, "sessions.json")
 process.env.HOME = workspace
 fs.writeFileSync(
   path.join(workspace, "bridge.mjs"),
-  source + "\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, takeParked, park, parked, instructionsIdentity, digest, Turn };\n",
+  source + "\nexport { conversationKey, stripVolatileOpening, stripVolatileSystem, isContinuedOpening, openingTextOf, sameInstructions, historyKey, Turn };\n",
 )
 const {
   conversationKey,
@@ -25,11 +24,6 @@ const {
   openingTextOf,
   sameInstructions,
   historyKey,
-  takeParked,
-  park,
-  parked,
-  instructionsIdentity,
-  digest,
   Turn,
 } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
@@ -340,61 +334,6 @@ test("isContinuedOpening keeps first-message images in the continuation identity
   assert.equal(isContinuedOpening(proc, grownOther), false)
 })
 
-test("takeParked uses the same instruction stripping, so a clock change still resumes", () => {
-  const convKey = "test-parked-key"
-  const history = [{ role: "user", content: STABLE }, { role: "assistant", content: "ok" }]
-  park({
-    convKey,
-    sessionId: "sess-parked",
-    expectedMessages: history,
-    instructions: "Rules.\nCurrent date: 2026-11-10\n",
-    workDir: "/tmp/agy-park-test",
-    hasSentFirstTurn: true,
-    historyInvalid: false,
-    turn: null,
-    dead: false,
-    canPark() { return true },
-  })
-  const resumed = takeParked(convKey, {
-    workDir: "/tmp/agy-park-test",
-    instructions: "Rules.\nCurrent date: 2026-11-11\n",
-    history,
-  })
-  assert.ok(resumed, "clock-only change must still take the parked session")
-  assert.equal(resumed.sessionId, "sess-parked")
-  assert.equal(
-    instructionsIdentity("Rules.\nCurrent date: 2026-11-10\n"),
-    instructionsIdentity("Rules.\nCurrent date: 2026-11-11\n"),
-  )
-})
-
-test("#1151: a parked session is keyed on the instructions as agy was sent them", () => {
-  // A session agy opened before a line was reworded keeps the line, so a
-  // version that rewords it must not resume that session.
-  const convKey = "test-parked-sent"
-  const history = [{ role: "user", content: STABLE }, { role: "assistant", content: "ok" }]
-  const instructions = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.\nRules.\n"
-  const proc = {
-    convKey,
-    sessionId: "sess-sent",
-    expectedMessages: history,
-    instructions,
-    workDir: "/tmp/agy-park-test",
-    hasSentFirstTurn: true,
-    historyInvalid: false,
-    turn: null,
-    dead: false,
-    canPark() { return true },
-  }
-  park(proc)
-  const entry = JSON.parse(fs.readFileSync(process.env.AGY_BRIDGE_STATE_FILE, "utf8")).entries.find((e) => e.key === convKey)
-  const sent = "You're a coding agent running in the Codex CLI, a terminal-based coding assistant.\nRules.\n"
-  assert.equal(entry.instructionsHash, digest(instructionsIdentity(sent)))
-  assert.notEqual(entry.instructionsHash, digest(instructionsIdentity(instructions)))
-  const resumed = takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions, history })
-  assert.equal(resumed?.sessionId, "sess-sent", "the same instructions still resume")
-})
-
 async function withKit(options, fn) {
   const kit = await createBridgeKit(options)
   try {
@@ -498,7 +437,106 @@ test("two chats that share an 8 KiB first-message prefix get distinct fake agy s
   })
 })
 
-test("the same chat with only a system clock change reuses the fake agy session", async () => {
+test("a full pool waits for an exiting process before starting the next request", { timeout: 10_000 }, async () => {
+  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" } }, async (kit) => {
+    const procs = kit.module.__agyTestAllProcs
+    let finishStop
+    let markWaited
+    const stopped = new Promise((resolve) => { finishStop = resolve })
+    const waited = new Promise((resolve) => { markWaited = resolve })
+    // Hold the exact window after pool removal and before allProcs removal.
+    const exiting = {
+      stopping: true,
+      get stopPromise() {
+        markWaited()
+        return stopped
+      },
+    }
+    procs.add(exiting)
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("ok")
+      return { stopReason: "end_turn" }
+    }
+    const pending = kit.request(baseBody({ messages: [{ role: "user", content: "next request" }] }))
+    try {
+      const outcome = await Promise.race([
+        waited.then(() => "waiting"),
+        pending.then(() => "responded"),
+      ])
+      assert.equal(outcome, "waiting", "capacity must wait instead of returning 503")
+      assert.equal(kit.acpSpawns.length, 0, "an exiting process still occupies its slot")
+    } finally {
+      procs.delete(exiting)
+      finishStop()
+    }
+    const response = await pending
+    assert.equal(response.status, 200)
+    assert.equal((await readSse(response)).stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 1)
+  })
+})
+
+test("a rendering failure before streaming releases the new process and workspace", async () => {
+  const marker = "injected prompt rendering failure"
+  await withKit({ indexTransform: (source) => source.replace(
+    "const currentParts = renderTurnMessagesParts(current)",
+    `throw new Error(${JSON.stringify(marker)})`,
+  ) }, async (kit) => {
+    const response = await kit.request(baseBody())
+    assert.equal(response.status, 502)
+    assert.ok((await response.text()).includes(marker))
+    assert.equal(kit.module.__agyTestAllProcs.size, 0)
+    assert.equal(kit.module.__agyTestPool.size, 0)
+    assert.equal(promptEntries(kit).length, 0)
+    const session = kit.acpLog.find((entry) => entry.method === "session/new")
+    assert.ok(session)
+    assert.equal(fs.existsSync(session.params.cwd), false)
+  })
+})
+
+test("cancellation during ACP startup releases resources without sending a prompt", { timeout: 10_000 }, async () => {
+  const controller = new AbortController()
+  await withKit({ sessionNewDelayMs: 1000 }, async (kit) => {
+    const pending = kit.request(baseBody(), { signal: controller.signal })
+    while (!kit.acpLog.some((entry) => entry.method === "session/new")) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    controller.abort(new Error("cancel during startup"))
+    const response = await pending
+    assert.ok((await response.text()).includes("cancel during startup"))
+    assert.equal(promptEntries(kit).length, 0)
+    assert.equal(kit.module.__agyTestPool.size, 0)
+    assert.equal(kit.module.__agyTestAllProcs.size, 0)
+    const session = kit.acpLog.find((entry) => entry.method === "session/new")
+    assert.equal(fs.existsSync(session.params.cwd), false)
+  })
+})
+
+test("cancellation stops waiting for capacity without spawning another process", { timeout: 10_000 }, async () => {
+  const controller = new AbortController()
+  await withKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" } }, async (kit) => {
+    let markWaited
+    const waited = new Promise((resolve) => { markWaited = resolve })
+    const stopping = new Promise(() => {})
+    const exiting = { stopping: true, get stopPromise() { markWaited(); return stopping } }
+    const procs = kit.module.__agyTestAllProcs
+    procs.add(exiting)
+    try {
+      const pending = kit.request(baseBody(), { signal: controller.signal })
+      await waited
+      controller.abort(new Error("cancel capacity wait"))
+      const response = await pending
+      assert.ok((await response.text()).includes("cancel capacity wait"))
+      assert.equal(kit.acpSpawns.length, 0)
+      assert.equal(kit.module.__agyTestPool.size, 0)
+      assert.equal(procs.has(exiting), true, "another process's cleanup must not be cancelled")
+    } finally {
+      procs.delete(exiting)
+    }
+  })
+})
+
+test("each request opens a new fake agy session and replays the conversation", async () => {
   await withKit({}, async (kit) => {
     kit.defaultPrompt = async (agent) => {
       await agent.text("ok")
@@ -521,13 +559,17 @@ test("the same chat with only a system clock change reuses the fake agy session"
     })
     const again = await readSse(await kit.request(turn2))
     assert.equal(again.stopReason, "end_turn")
+    const prompts = promptEntries(kit)
+    assert.equal(prompts.length, 2, `expected two prompts, got ${prompts.length}`)
     const sessions = promptSessions(kit)
-    assert.equal(sessions.length, 2, `expected two prompts, got ${JSON.stringify(sessions)}`)
-    assert.equal(sessions[0], sessions[1], `clock-only change must reuse the session, got ${JSON.stringify(sessions)}`)
+    assert.notEqual(sessions[0], sessions[1], `every request needs its own session, got ${JSON.stringify(sessions)}`)
+    const text = promptText(prompts[1])
+    assert.equal(text.includes(firstMsg), true, `second request must replay the history: ${JSON.stringify(text)}`)
+    assert.equal(text.includes("continue"), true, `second request is missing its new turn: ${JSON.stringify(text)}`)
   })
 })
 
-test("a flattened growing first message reuses the live fake agy session", async () => {
+test("a flattened growing first message opens a new session with the whole message", async () => {
   await withKit({}, async (kit) => {
     kit.defaultPrompt = async (agent) => {
       await agent.text("ok")
@@ -546,14 +588,13 @@ test("a flattened growing first message reuses the live fake agy session", async
       messages: [{ role: "user", content: grown }],
     })))
     assert.equal(second.stopReason, "end_turn")
+    const prompts = promptEntries(kit)
+    assert.equal(prompts.length, 2, `expected two prompts, got ${prompts.length}`)
     const sessions = promptSessions(kit)
-    assert.equal(sessions.length, 2, `expected two prompts, got ${JSON.stringify(sessions)}`)
-    assert.equal(sessions[0], sessions[1], `flattened growth must reuse the session, got ${JSON.stringify(sessions)}`)
-    // The key still changes; reuse is via isContinuedOpening, not a shared key.
-    assert.notEqual(
-      conversationKey(body({ system: "You are a test agent.", first: opening })),
-      conversationKey(body({ system: "You are a test agent.", first: grown })),
-    )
+    assert.notEqual(sessions[0], sessions[1], `every request needs its own session, got ${JSON.stringify(sessions)}`)
+    const text = promptText(prompts[1])
+    assert.equal(text.includes(opening), true, `second request must send the whole opening: ${JSON.stringify(text)}`)
+    assert.equal(text.includes("step two is longer than four chars"), true, `second request is missing its new turn: ${JSON.stringify(text)}`)
   })
 })
 
@@ -581,7 +622,7 @@ test("an independent prompt that only extends the previous opening gets its own 
   })
 })
 
-test("a reused flattened session sends only the new turn, not earlier openings or replies", async () => {
+test("every request replays its whole flattened opening in a session of its own", async () => {
   await withKit({}, async (kit) => {
     const replies = ["reply-one-ok", "reply-two-ok", "reply-three-ok"]
     let n = 0
@@ -612,22 +653,20 @@ test("a reused flattened session sends only the new turn, not earlier openings o
     const prompts = promptEntries(kit)
     assert.equal(prompts.length, 3, `expected three prompts, got ${prompts.length}`)
     const sessions = prompts.map((entry) => entry.params?.sessionId || entry.sessionId)
-    assert.equal(sessions[0], sessions[1], `second turn must reuse the session, got ${JSON.stringify(sessions)}`)
-    assert.equal(sessions[1], sessions[2], `third turn must reuse the session, got ${JSON.stringify(sessions)}`)
+    assert.equal(new Set(sessions).size, 3, `every request needs its own session, got ${JSON.stringify(sessions)}`)
     const texts = prompts.map(promptText)
     const sizes = texts.map((text) => Buffer.byteLength(text, "utf8"))
     assert.equal(texts[1].includes("step two is longer than four chars"), true)
-    assert.equal(texts[1].includes("step one"), false, `second prompt resent the opening: ${JSON.stringify(texts[1])}`)
-    assert.equal(texts[1].includes(reply1), false, `second prompt resent the first reply: ${JSON.stringify(texts[1])}`)
-    assert.equal(texts[1].includes(STABLE.trim()), false)
+    assert.equal(texts[1].includes("step one"), true, `second prompt must replay the opening: ${JSON.stringify(texts[1])}`)
+    assert.equal(texts[1].includes(reply1), true, `second prompt must replay the first reply: ${JSON.stringify(texts[1])}`)
+    assert.equal(texts[1].includes(STABLE.trim()), true)
     assert.equal(texts[2].includes("step three is also a new turn"), true)
-    assert.equal(texts[2].includes("step one"), false, `third prompt resent the opening: ${JSON.stringify(texts[2])}`)
-    assert.equal(texts[2].includes("step two is longer than four chars"), false, `third prompt resent step two: ${JSON.stringify(texts[2])}`)
-    assert.equal(texts[2].includes(reply1), false)
-    assert.equal(texts[2].includes(reply2), false)
-    assert.ok(sizes[1] < sizes[0], `second prompt (${sizes[1]}) should be smaller than the initial prompt (${sizes[0]})`)
-    assert.ok(sizes[2] < sizes[0], `third prompt (${sizes[2]}) should stay smaller than the initial prompt (${sizes[0]})`)
-    assert.ok(Math.abs(sizes[2] - sizes[1]) < 80, `prompt sizes must not grow quadratically: ${JSON.stringify(sizes)}`)
+    assert.equal(texts[2].includes("step one"), true, `third prompt must replay the opening: ${JSON.stringify(texts[2])}`)
+    assert.equal(texts[2].includes("step two is longer than four chars"), true, `third prompt must replay step two: ${JSON.stringify(texts[2])}`)
+    assert.equal(texts[2].includes(reply1), true)
+    assert.equal(texts[2].includes(reply2), true)
+    assert.ok(sizes[1] > sizes[0], `second prompt (${sizes[1]}) should carry the grown opening (${sizes[0]})`)
+    assert.ok(sizes[2] > sizes[1], `third prompt (${sizes[2]}) should carry the grown opening (${sizes[1]})`)
   })
 })
 
@@ -684,7 +723,7 @@ test("a 12-character reply prefix on the same line does not reuse the session", 
   })
 })
 
-test("a reused flattened session also sends user messages after the first", async () => {
+test("a request with a trailing user message sends the whole flattened opening in a new session", async () => {
   await withKit({}, async (kit) => {
     kit.defaultPrompt = async (agent) => {
       await agent.text("ok")
@@ -709,16 +748,16 @@ test("a reused flattened session also sends user messages after the first", asyn
     const prompts = promptEntries(kit)
     assert.equal(prompts.length, 2)
     const sessions = prompts.map((entry) => entry.params?.sessionId || entry.sessionId)
-    assert.equal(sessions[0], sessions[1], `must reuse the session, got ${JSON.stringify(sessions)}`)
+    assert.notEqual(sessions[0], sessions[1], `every request needs its own session, got ${JSON.stringify(sessions)}`)
     const text = promptText(prompts[1])
     assert.equal(text.includes("step two is longer than four chars"), true, `missing new turn: ${JSON.stringify(text)}`)
     assert.equal(text.includes("and also the extra note after the flattened opening"), true, `dropped the trailing user message: ${JSON.stringify(text)}`)
-    assert.equal(text.includes("step one"), false, `resent the opening: ${JSON.stringify(text)}`)
-    assert.equal(text.includes(reply), false, `resent the first reply: ${JSON.stringify(text)}`)
+    assert.equal(text.includes("step one"), true, `dropped the opening: ${JSON.stringify(text)}`)
+    assert.equal(text.includes(reply), true, `dropped the first reply: ${JSON.stringify(text)}`)
   })
 })
 
-test("a reused flattened session keeps a new document on the grown first message", async () => {
+test("a request with a new document keeps it beside the grown first message", async () => {
   await withKit({}, async (kit) => {
     kit.defaultPrompt = async (agent) => {
       await agent.text("ok")
@@ -746,11 +785,11 @@ test("a reused flattened session keeps a new document on the grown first message
     const prompts = promptEntries(kit)
     assert.equal(prompts.length, 2)
     const sessions = prompts.map((entry) => entry.params?.sessionId || entry.sessionId)
-    assert.equal(sessions[0], sessions[1], `must reuse the session, got ${JSON.stringify(sessions)}`)
+    assert.notEqual(sessions[0], sessions[1], `every request needs its own session, got ${JSON.stringify(sessions)}`)
     const text = promptText(prompts[1])
     assert.equal(text.includes("step two is longer than four chars"), true, `missing new turn: ${JSON.stringify(text)}`)
     assert.equal(text.includes("document body unique-xyz"), true, `dropped the new document: ${JSON.stringify(text)}`)
-    assert.equal(text.includes("step one"), false, `resent the opening: ${JSON.stringify(text)}`)
+    assert.equal(text.includes("step one"), true, `dropped the opening: ${JSON.stringify(text)}`)
   })
 })
 
@@ -791,54 +830,6 @@ test("a turn lets go of each earlier request body once the next one arrives", ()
   assert.equal(steps[2].body, bodies[2], "the current step keeps its body for a late prompt")
   assert.equal(typeof steps[2].contentSnapshot, "function")
   assert.equal(turn.responseSteps.length, 3)
-})
-
-test("a session parked before a user's turn was cloaked is not resumed", () => {
-  // agy keeps the user's turns it was sent; one with Codex's GPT-5 line as
-  // written is turned away on every later turn.
-  const convKey = "test-parked-user-cloak"
-  const history = [{ role: "user", content: STABLE }, { role: "assistant", content: "ok" }]
-  const proc = {
-    convKey, sessionId: "sess-user-cloak", expectedMessages: history, instructions: "Rules.\n",
-    workDir: "/tmp/agy-park-test", hasSentFirstTurn: true, historyInvalid: false, turn: null, dead: false,
-    canPark() { return true },
-  }
-  park(proc)
-  const file = process.env.AGY_BRIDGE_STATE_FILE
-  const state = JSON.parse(fs.readFileSync(file, "utf8"))
-  const saved = state.entries.find((e) => e.key === convKey)
-  assert.ok(saved.userCloak, "a parked session says its prompts were cloaked")
-  assert.equal(takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions: "Rules.\n", history })?.sessionId, "sess-user-cloak")
-  // the same entry as an older version wrote it
-  park(proc)
-  delete parked.get(convKey).userCloak
-  assert.equal(takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions: "Rules.\n", history }), null)
-})
-
-test("a session parked with its instructions appended to agy's is resumed only while they still go there", () => {
-  // bzs_1 on X (11-15): agy keeps appended instructions in its own system
-  // instruction, which Antigravity turns away, so a session opened that way
-  // is not resumed once they go in the first user turn.
-  const convKey = "test-parked-append"
-  const history = [{ role: "user", content: STABLE }, { role: "assistant", content: "ok" }]
-  const proc = {
-    convKey, sessionId: "sess-append", expectedMessages: history, instructions: "Rules.\n", instructionsInSession: true,
-    workDir: "/tmp/agy-park-test", hasSentFirstTurn: true, historyInvalid: false, turn: null, dead: false,
-    canPark() { return true },
-  }
-  park(proc)
-  assert.equal(takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions: "Rules.\n", history }), null)
-  park(proc)
-  process.env.AGY_BRIDGE_SYSTEM_APPEND = "1"
-  try {
-    assert.equal(takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions: "Rules.\n", history })?.sessionId, "sess-append")
-  } finally {
-    delete process.env.AGY_BRIDGE_SYSTEM_APPEND
-  }
-  // the same entry as an older version wrote it, when instructions were appended
-  park({ ...proc, instructionsInSession: false })
-  delete parked.get(convKey).instructionsInSession
-  assert.equal(takeParked(convKey, { workDir: "/tmp/agy-park-test", instructions: "Rules.\n", history }), null)
 })
 
 test("a user's turn goes to agy with Codex's GPT-5 lines reworded", async () => {

@@ -22,9 +22,9 @@ response.
   the account's region, it reads the quota the way agy does (see "Usage
   quota").
 - Tools that belong to the client, such as file reads, writes and shell commands,
-  are exposed to the model over MCP. The client runs them and the results flow
-  back into the same agy conversation, so the model sees ordinary native tool
-  calls.
+  are exposed to the model over MCP. The plugin returns tool calls to the client
+  for execution. The client sends results in a later request, and the plugin
+  replays the history and results as text in a new ACP session.
 - Account standing is outside the plugin's control. If Google changes its usage
   policies, the plugin cannot promise your account will not be restricted.
 
@@ -38,14 +38,12 @@ channel: Antigravity's models over ACP. The differences:
   This plugin runs the `agy` CLI (`agy acp`): your own when you have one, and
   when the machine has none, signing in from Magpie installs one the way
   Google's own installer does (see "Requirements").
-- **Sessions**: Antigravity ACP opens a new session per request and carries the
-  history as context. This plugin keeps a pool of agy processes, reuses one agy
-  session for one conversation, and picks it up again with `session/resume`
-  after a restart; only when that fails does it replay the history, within a
-  byte budget.
-- **Tool calls**: Antigravity ACP ends the turn with the call as the reply's
-  `tool_calls`. This plugin feeds the client's result back into the same agy
-  turn (see "Tool bridge" below).
+- **Sessions**: both open a new ACP session per request and carry history as
+  context. This plugin replays history as text within a byte budget and
+  terminates the request's agy process when the response ends.
+- **Tool calls**: this plugin returns calls to the client in the response. The
+  client executes them and submits results in a later request, which the plugin
+  replays in a new session (see "Tool bridge" below).
 - **Usage**: this plugin reads agy's own `/usage` report; Antigravity ACP reads
   the quota each reply carries.
 
@@ -73,21 +71,17 @@ MCP server. The control port listens on loopback only, with a token per process.
   prompt is sent) and reads what it offers; until it has, only Gemini is listed.
   The last list agy gave and offered is kept in `models.json` beside the session
   state file, so after a restart that list is served while agy is asked again.
-  Models and thinking levels can be switched mid-conversation without losing
-  history.
+  Later requests can switch models and thinking levels while replaying history
+  within the byte budget.
 - **Streaming with thought summaries**: summaries come back as `thinking` blocks.
   Set `AGY_BRIDGE_THINKING=0` to turn them off.
 - **Image input**: inline base64 PNG, JPEG, GIF and WebP. This needs agy 1.5.0 or
   newer, because the ACP server has to advertise image support. An image a tool
   returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
   agy would save it to a file the model can't open.
-- **Tool calls**: parallel and consecutive calls both work. A tool that runs past
-  150 seconds first gets a "still running" placeholder; once the real result
-  arrives, the same turn continues, and the client executes each call exactly once.
-- **Session resume**: each finished turn is recorded. After a Magpie or plugin
-  restart, the session continues through `session/resume` as long as the history
-  and instruction hashes still match. The state file stores session IDs and
-  hashes, never message text.
+- **Tool calls**: batched and consecutive calls are supported. The client runs
+  the tools, and results are replayed in the history of a later request; the
+  plugin does not wait for tool results in the original agy process.
 - **Isolation**: your global MCP configuration is never read. Every agy process
   runs with a temporary agent, and every permission request agy raises for its
   own tools (shell, file edits, browser) is refused. A request for one of the
@@ -96,8 +90,7 @@ MCP server. The control port listens on loopback only, with a token per process.
   happen on the client side.
 - **Assistant prefill**: requests that end with a text-only assistant message
   (SillyTavern presets, "continue"/"impersonate", bot frameworks) are served
-  instead of rejected; the session ledger stays aligned across turns. See
-  "Assistant prefill" below.
+  instead of rejected. See "Assistant prefill" below.
 - **Usage visibility**: Magpie shows the agy subscription usage windows. They are
   informational only; running out of quota does not block requests automatically.
 
@@ -108,9 +101,8 @@ SillyTavern preset prefill, a "continue" / "impersonate" turn, a bot
 framework's assembled context) used to be rejected with a 400. The prefill now
 becomes part of the current turn:
 
-- The prefill stays in the tail, so the session ledger (expectedMessages,
-  client bytes) stays aligned with the client's own history across turns — the
-  session is reused after a prefill turn instead of replaying from scratch;
+- The prefill stays in the tail; later requests still replay history as text
+  in a new session;
 - The prefill text renders as a continuation carrier (a note line plus the
   fragment itself), telling the model to continue from where the fragment
   stops;
@@ -120,8 +112,7 @@ becomes part of the current turn:
 Known limits: a prefill alongside a live tool_result, or directly after an
 unanswered tool_use, is still rejected; a
 contiguous assistant tail with no user message before it is treated as one
-prefill run (that turn degrades to a fresh session and self-heals on the next
-turn); the models a client gets remain agy's decision.
+prefill run; the models a client gets remain agy's decision.
 
 ## Requirements
 
@@ -252,13 +243,9 @@ usage reads wait 10 minutes before the next try, doubling up to 6 hours.
 | `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; see "Minimal agent" below |
 | `AGY_BRIDGE_SYSTEM_APPEND` | off | Set to `1` to append the client's system prompt to agy's own instead of putting it in the first prompt; see below |
-| `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed; the session can still resume |
-| `AGY_BRIDGE_SPARE` | on | Keeps one spare agy per account, started but with no session and no request sent, so a new conversation skips agy's start; set to `0` to turn it off |
-| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | How long a reclaimed session stays resumable (6 hours) |
-| `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | Where resumable session records are kept |
-| `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | After this long, a still-running client tool gets a "still running" reply |
-| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | Limits for process startup, agy silence, and waiting on a client tool result |
-| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | How long a suspended tool turn whose client disconnected may keep its pool slot |
+| `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed |
+| `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | State file path |
+| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` | 60 s / 5 min | Limits for process startup and agy silence |
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
 | `AGY_BRIDGE_STORED_SIGNIN` | unset | `skip` stops the plugin from reading agy's stored sign-in |
@@ -339,9 +326,9 @@ off unless you turn it on.
   latter as a rate limit), and its `⚠ API error (attempt N)` retry lines are
   dropped.
 - **HTTP 409 saying tool results do not match the history**: usually the client
-  rewrote the history or tool IDs mid-conversation. When the plugin can work out
-  the correct match it rebuilds the session; when it cannot, it refuses rather
-  than guessing. Hermes Agent writes one batching `tool_call({"calls": [...]})`
+  rewrote the history or tool IDs mid-conversation. The plugin refuses incomplete
+  tool history rather than guessing; continue from the last self-consistent
+  history. Hermes Agent writes one batching `tool_call({"calls": [...]})`
   into its history as one call per entry; the plugin folds those back into the
   one call agy made, with one result (#1150).
 - **Turning thought summaries off**: set `AGY_BRIDGE_THINKING=0`, or send

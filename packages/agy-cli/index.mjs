@@ -67,11 +67,9 @@ function maxProcs() {
 function detachedEvictMs() {
   return positiveTimeout(process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 30_000)
 }
-const MAX_PARKED = 32
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
-const RESUME_TTL_MS = positiveTimeout(process.env.AGY_BRIDGE_RESUME_TTL_MS, 6 * 60 * 60 * 1000)
 // agy fails an ide-tools MCP call after a fixed three minutes. Answer before
 // that with a "still running" note; an identical repeat call waits for the
 // original result instead of reaching the client again.
@@ -173,7 +171,6 @@ const FALLBACK_MODELS = [
 ]
 
 const pool = new Map()
-const parked = new Map()
 const allProcs = new Set()
 const sessions = new Map()
 const toolCalls = new Map()
@@ -260,8 +257,7 @@ export function noDefaultCustomizationsArgs(agyPath) {
   return acpHelp(agyPath).then((help) => (/--include-default-customizations\b/.test(help) ? ["--include-default-customizations=false"] : []))
 }
 
-// The bridge's own agy folder, kept across restarts so agy finds a
-// conversation again on session/resume. AGY_BRIDGE_GEMINI_DIR names another;
+// The bridge's own agy folder, kept across restarts. AGY_BRIDGE_GEMINI_DIR names another;
 // "default" (or 0, off, …) leaves agy on its own ~/.gemini, skills and all.
 export function bridgeGeminiDir(env = process.env) {
   const named = env.AGY_BRIDGE_GEMINI_DIR || ""
@@ -700,7 +696,7 @@ function fallbackModelCatalog(agyPath = null) {
 const SAVED_CATALOG_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
 
 function modelCatalogFile() {
-  return path.join(path.dirname(sessionStateFile()), "models.json")
+  return path.join(stateDir(), "models.json")
 }
 
 function validModelRow(row) {
@@ -1771,7 +1767,6 @@ class Proc {
     this.agyPath = agyPath
     this.#assign(convKey, opts)
     this.workDir = opts.workDir
-    this.spareKey = null
     this.token = randomUUID()
     this.sessionId = null
     this.currentModel = null
@@ -1789,7 +1784,6 @@ class Proc {
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
     this.instructionsInSession = false
-    this.resumed = false
     this.child = null
     this.conn = null
     this.workspace = null
@@ -1825,34 +1819,27 @@ class Proc {
     this.userId = opts.userId || ""
     this.openingText = openingTextOf(opts.messages?.[0])
     this.openingImages = openingImagesOf(opts.messages?.[0])
-    this.resumeFrom = opts.resume || null
   }
 
-  async start() {
-    await this.#spawn()
-    await this.#withStartTimeout(async () => {
-      await this.#initialize()
-      await this.#openSession()
-    })
+  async start(signal) {
+    signal?.throwIfAborted()
+    // Finish filesystem setup before stopping, so cleanup cannot race a late spawn.
+    await this.#spawn(signal)
+    const abort = () => { this.stop().catch(() => {}) }
+    signal?.addEventListener("abort", abort, { once: true })
+    try {
+      signal?.throwIfAborted()
+      await waitForRequest(this.#withStartTimeout(async () => {
+        await this.#initialize()
+        signal?.throwIfAborted()
+        await this.#openSession()
+      }), signal)
+    } finally {
+      signal?.removeEventListener("abort", abort)
+    }
   }
 
-  // A spare: agy started and initialised, with no session. agy sends nothing
-  // to Google until session/new (it reads its sign-in then too), so a spare
-  // costs a process and no request.
-  async warm() {
-    await this.#spawn()
-    await this.#withStartTimeout(() => this.#initialize())
-  }
-
-  // A conversation takes a warmed spare and opens its session on it.
-  async adopt(convKey, opts) {
-    this.#assign(convKey, opts)
-    this.spareKey = null
-    this.lastUsed = Date.now()
-    await this.#withStartTimeout(() => this.#openSession())
-  }
-
-  async #spawn() {
+  async #spawn(signal) {
     await ensureControlServer()
     const bin = await ensureShimDir()
     sessions.set(this.token, this)
@@ -1878,6 +1865,7 @@ class Proc {
       : own.dir ? path.join(own.dir, "antigravity-cli", "conversations")
         : home ? path.join(home, ".gemini", "antigravity-cli", "conversations")
           : null
+    signal?.throwIfAborted()
     try {
       const childEnv = { ...process.env }
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -1955,44 +1943,23 @@ class Proc {
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
     this.appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
-    this.resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
   }
 
   async #openSession() {
-    const resumable = this.resumable
     this.instructionsInSession = this.appendable && systemAppend() && !!this.instructions
     const meta = this.instructionsInSession
       ? { _meta: { antigravity: { systemPrompt: { append: outgoing(this.instructions) } } } }
       : {}
 
-    let session = null
-    if (this.resumeFrom && resumable) {
-      try {
-        session = await this.conn.request("session/resume", {
-          sessionId: this.resumeFrom.sessionId,
-          cwd: this.workspace,
-          mcpServers: [],
-          ...meta,
-        })
-        if (!session || typeof session !== "object") throw new Error("empty session/resume result")
-        this.sessionId = this.resumeFrom.sessionId
-        this.resumed = true
-        this.hasSentFirstTurn = true
-        this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
-      } catch {
-        session = null
-      }
-    }
-    if (!this.resumed) {
-      session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
-      if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
-      this.sessionId = session.sessionId
-    }
-    // A resumed session reports the account default; always apply the selection.
+    // Every task opens its own session. An evicted or restarted conversation
+    // is not resumed; its history is replayed into this new session instead.
+    const session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
+    if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
+    this.sessionId = session.sessionId
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     noteOfferedModels(this.configOptions, session?.models)
-    if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
+    if (this.model) await this.#setModel(this.model, this.selection)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
 
@@ -2006,21 +1973,21 @@ class Proc {
     if (updated?.currentValue !== value) throw new Error(`agy did not apply session option ${config.id}`)
   }
 
-  async #setModel(model, selection, force = false) {
+  async #setModel(model, selection) {
     const selectionKey = stableJSON({ model, selection })
-    if (!force && this.currentSelectionKey === selectionKey) return
+    if (this.currentSelectionKey === selectionKey) return
     try {
       let configured = false
       const target = this.configMethodUnsupported ? null : configModelSelection(this.configOptions, model, selection)
       if (target) {
         try {
-          if (force || target.config.currentValue !== target.value) await this.#setConfig(target.config, target.value)
+          if (target.config.currentValue !== target.value) await this.#setConfig(target.config, target.value)
           // A model change can replace the thinking options and their values.
           const thought = configSelect(this.configOptions, "thought_level")
           const levels = selectValues(thought?.options).map(option => option.value).filter(value => EFFORT_ORDER.includes(value))
           if (target.effort && levels.length) {
             const level = closestEffort(target.effort, levels)
-            if (force || thought.currentValue !== level) await this.#setConfig(thought, level)
+            if (thought.currentValue !== level) await this.#setConfig(thought, level)
             configured = true
           } else {
             // A standalone model is fully selected by its advertised value.
@@ -2032,7 +1999,7 @@ class Proc {
           this.configMethodUnsupported = true
         }
       }
-      if (!configured && (force || model !== this.currentModel || target)) {
+      if (!configured && (model !== this.currentModel || target)) {
         await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model }, 30_000)
       }
     } catch (error) {
@@ -2310,7 +2277,6 @@ class Proc {
           return
         }
         turn.arm()
-        unpark(this.convKey)
         this.hasSentFirstTurn = true
         // agy hands Antigravity the prompt as a user's turn, where Codex's
         // GPT-5 lines are turned away too (cloak.mjs, USER_TURNED_AWAY)
@@ -2647,10 +2613,7 @@ class Proc {
           : { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
       }
     }
-    if (this.turn === turn) {
-      this.turn = null
-      if (!this.stopping && !this.retiring) park(this)
-    }
+    if (this.turn === turn) this.turn = null
   }
 
   abandonTurn(turn) {
@@ -2673,11 +2636,6 @@ class Proc {
       waiter.resolve()
     }
     if (this.turn && !this.turn.done && !this.stopping) this.turn.fail(error)
-  }
-
-  canPark() {
-    return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
-      !this.dead && Array.isArray(this.expectedMessages)
   }
 
   stop() {
@@ -2877,43 +2835,17 @@ function digest(value) {
   return createHash("sha256").update(value).digest("hex")
 }
 
-// Resumable sessions survive a plugin or Magpie restart: agy keeps the
-// conversation on disk, and this file maps a conversation to its agy session.
-// It stores only hashes of the history and instructions, never message text.
-function sessionStateFile() {
-  if (process.env.AGY_BRIDGE_STATE_FILE) return process.env.AGY_BRIDGE_STATE_FILE
+// The bridge's state folder, kept across restarts (the model catalog and
+// other small caches live there). AGY_BRIDGE_STATE_FILE names it by a file
+// path, as earlier versions did, for the same folder.
+function stateDir() {
+  if (process.env.AGY_BRIDGE_STATE_FILE) return path.dirname(process.env.AGY_BRIDGE_STATE_FILE)
   const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
-  return path.join(base, "magpie-agy-bridge", "sessions.json")
-}
-
-let parkedLoaded = false
-const unparked = new Set()
-
-function readStateFile() {
-  try {
-    const data = JSON.parse(fs.readFileSync(sessionStateFile(), "utf8"))
-    return data?.version === 1 && Array.isArray(data.entries) ? data.entries : []
-  } catch {
-    return []
-  }
-}
-
-function validEntry(entry) {
-  return entry && typeof entry.key === "string" && typeof entry.sessionId === "string" &&
-    typeof entry.historyHash === "string" && typeof entry.instructionsHash === "string" &&
-    Number.isFinite(entry.at) && Date.now() - entry.at <= RESUME_TTL_MS
-}
-
-function loadParked() {
-  if (parkedLoaded) return
-  parkedLoaded = true
-  for (const entry of readStateFile().filter(validEntry).sort((a, b) => a.at - b.at)) {
-    if (!parked.has(entry.key)) parked.set(entry.key, entry)
-  }
+  return path.join(base, "magpie-agy-bridge")
 }
 
 // Hold a short-lived lockfile around read-merge-rename so concurrent bridge
-// processes do not overwrite each other's parked session updates.
+// processes do not overwrite each other's catalog updates.
 function withStateLock(file, fn) {
   const lock = `${file}.lock`
   let fd = null
@@ -2948,82 +2880,8 @@ function withStateLock(file, fn) {
   }
 }
 
-// Merge with the file so concurrent bridge processes do not erase each other.
-function saveParked() {
-  const file = sessionStateFile()
-  try {
-    withStateLock(file, () => {
-      const merged = new Map()
-      for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
-      for (const key of unparked) merged.delete(key)
-      for (const [key, entry] of parked) {
-        if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
-      }
-      const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
-      const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
-      fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
-      fs.renameSync(temp, file)
-      unparked.clear()
-    })
-  } catch {}
-}
-
-function unpark(convKey) {
-  loadParked()
-  if (!parked.has(convKey) && !readStateFile().some((entry) => entry?.key === convKey)) return
-  parked.delete(convKey)
-  unparked.add(convKey)
-  saveParked()
-}
-
-// Remember a session so a later request, or a restarted bridge, resumes it
-// instead of replaying history. Called after every completed turn and on retire.
-function park(proc) {
-  if (!proc.canPark()) return
-  loadParked()
-  parked.delete(proc.convKey)
-  unparked.delete(proc.convKey)
-  parked.set(proc.convKey, {
-    key: proc.convKey,
-    sessionId: proc.sessionId,
-    historyHash: digest(historyKey(proc.expectedMessages)),
-    historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
-    toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
-    instructionsHash: digest(sentInstructionsIdentity(proc.instructions)),
-    userCloak: USER_CLOAK,
-    instructionsInSession: !!proc.instructionsInSession,
-    workDir: proc.workDir,
-    at: Date.now(),
-  })
-  while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
-  saveParked()
-}
-
-function takeParked(convKey, opts) {
-  loadParked()
-  const entry = parked.get(convKey)
-  if (!entry) return null
-  parked.delete(convKey)
-  unparked.add(convKey)
-  saveParked()
-  if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions)) ||
-    entry.userCloak !== USER_CLOAK || entry.instructionsInSession !== (systemAppend() && !!opts.instructions)) return null
-  const incoming = digest(historyKey(opts.history))
-  if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history }
-  // Sans-inputs resume needs the hashes written by current park(). Old
-  // entries without them still resume on an exact historyHash match only.
-  const incomingSans = digest(historyKey(stripToolUseInputs(opts.history)))
-  const incomingIds = toolUseIdentitiesKey(opts.history)
-  const idsOk = incomingIds != null && entry.toolUseIdentitiesHash === digest(incomingIds)
-  const sansOk = entry.historyHashSansInputs === incomingSans || entry.historyHash === incomingSans
-  if (!idsOk || !sansOk) return null
-  return { sessionId: entry.sessionId, expectedMessages: opts.history }
-}
-
 async function retire(key, proc) {
   proc.retiring = true
-  park(proc)
   if (pool.get(key) === proc) pool.delete(key)
   await proc.stop().catch(() => {})
 }
@@ -3043,7 +2901,6 @@ async function evictIdle() {
     }
   }
   for (const [key, proc] of victims) await retire(key, proc)
-  evictIdleSpares(cutoff)
   for (const { proc, turn, reason } of stale) {
     if (proc.turn !== turn || proc.retiring) continue
     logBridgeEvent(proc, turn, "reclaim", reason, {}, { trigger: "evict_idle" })
@@ -3083,82 +2940,19 @@ async function evictLRU() {
 
 setInterval(() => { evictIdle().catch(() => {}) }, 60_000).unref()
 
-// A spare agy: started and initialised, with no session, so the next new
-// conversation skips agy's start (spawn to initialize: ~0.25s warm, ~1s cold
-// on Linux). Only the process is warmed. agy reaches no host from spawn
-// through initialize and idling; session/new is where it signs in and asks
-// Google for the account, models, quota and settings, and a session nobody
-// uses still writes a trajectory at Google when it closes. A session is also
-// opened with the conversation's own instructions. So sessions are never
-// opened ahead. One spare per way of starting agy (launchKey: the account's
-// home, the binary, the folder, flags and environment); idle spares go after
-// IDLE_MS like the pool's processes, first when the pool needs room, and with
-// the host (reapOnExit; agy also exits when its stdin closes).
-// AGY_BRIDGE_SPARE=0 turns them off.
-const spares = new Map()
-const SPARE_MAX = 2
-
-function sparesOn() {
-  return !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_SPARE || "")
-}
-
-// Everything that decides how Proc starts agy for the current work.
-async function launchKey(agyPath, workDir) {
-  let mtime = 0
-  try { mtime = (await fs.promises.stat(agyPath)).mtimeMs } catch {}
-  const own = await geminiDirArgs(agyPath)
-  return digest(JSON.stringify([currentHome(), agyPath, mtime, workDir || "",
-    await noDefaultCustomizationsArgs(agyPath), own.args, childEnv(process.env)]))
-}
-
-function dropSpare(spare) {
-  if (spares.get(spare.spareKey) === spare) spares.delete(spare.spareKey)
-  return spare.stop().catch(() => {})
-}
-
-async function takeSpare(agyPath, workDir) {
-  if (!spares.size || !sparesOn()) return null
-  const key = await launchKey(agyPath, workDir)
-  const spare = spares.get(key)
-  if (!spare) return null
-  spares.delete(key)
-  try {
-    await spare.ready
-  } catch {
-    return null
-  }
-  if (spare.dead || spare.stopping) {
-    await spare.stop().catch(() => {})
-    return null
-  }
-  return spare
-}
-
-async function warmSpare(agyPath, workDir) {
-  if (!agyPath || !sparesOn()) return
-  const key = await launchKey(agyPath, workDir)
-  if (spares.has(key)) return
-  // never at the cost of a conversation's room
-  if (allProcs.size + 1 >= maxProcs()) return
-  if (spares.size >= SPARE_MAX) {
-    let oldest = null
-    for (const spare of spares.values()) if (!oldest || spare.lastUsed < oldest.lastUsed) oldest = spare
-    await dropSpare(oldest)
-  }
-  if (spares.has(key) || allProcs.size + 1 >= maxProcs()) return
-  const proc = new Proc(agyPath, null, { workDir })
-  proc.spareKey = key
-  spares.set(key, proc)
-  proc.ready = proc.warm().catch(async (error) => {
-    await dropSpare(proc)
-    throw error
+// Abort only this request's wait; shared cleanup must continue to completion.
+async function waitForRequest(promise, signal) {
+  if (!signal) return promise
+  let abort
+  const cancelled = new Promise((_resolve, reject) => {
+    abort = () => reject(signal.reason || new Error("request aborted"))
+    signal.addEventListener("abort", abort, { once: true })
+    if (signal.aborted) abort()
   })
-  proc.ready.catch(() => {})
-}
-
-function evictIdleSpares(cutoff) {
-  for (const spare of [...spares.values()]) {
-    if (spare.dead || spare.lastUsed < cutoff) dropSpare(spare)
+  try {
+    return await Promise.race([promise, cancelled])
+  } finally {
+    signal.removeEventListener("abort", abort)
   }
 }
 
@@ -3204,7 +2998,15 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
       }
       const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked)
-      return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
+      try {
+        opts.signal?.throwIfAborted()
+        return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
+      } catch (error) {
+        dropFromPool(value.proc)
+        if (value.proc.turn) value.proc.finalizeTurn(value.proc.turn)
+        await value.proc.stop().catch(() => {})
+        throw error
+      }
     })
     if (outcome.retry) {
       extra = outcome.retry
@@ -3298,34 +3100,32 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     dropFromPool(existing)
     await existing.stop().catch(() => {})
   }
-  const spare = await takeSpare(agyPath, opts.workDir)
-  while (!spare && allProcs.size >= maxProcs()) {
-    const idle = spares.values().next().value
-    if (idle) {
-      await dropSpare(idle)
+  while (allProcs.size >= maxProcs()) {
+    // A completed HTTP response may still be terminating its agy process.
+    // Keep counting that process, but wait for its slot instead of returning 503.
+    const stopping = [...allProcs].filter((proc) => proc.stopping && proc.stopPromise)
+    if (stopping.length) {
+      await waitForRequest(Promise.race(stopping.map((proc) => proc.stopPromise)), opts.signal)
       continue
     }
     if (!(await evictLRU())) {
       throw new BusyError(`agy bridge: ${maxProcs()} agy processes are running and all have unfinished responses`)
     }
   }
-  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
-  const proc = spare ?? new Proc(agyPath, key, { ...opts, resume })
+  opts.signal?.throwIfAborted()
+  const proc = new Proc(agyPath, key, opts)
   try {
-    if (spare) await spare.adopt(key, { ...opts, resume })
-    else await proc.start()
+    await proc.start(opts.signal)
   } catch (error) {
     await proc.stop().catch(() => {})
     throw error
   }
   pool.set(key, proc)
-  // the next new conversation of this account and folder takes one ready
-  warmSpare(agyPath, opts.workDir).catch(() => {})
   // Why this request got a new agy session, so a cache that never hits can be
   // traced to the check that failed (#1058). Counts only, never content.
   logSessionEvent(proc, why, {
-    fresh: !!isFreshConversation, resumed: !!proc.resumed, spare: !!spare,
-    parked: !!resume, history: Array.isArray(opts.history) ? opts.history.length : null,
+    fresh: !!isFreshConversation,
+    history: Array.isArray(opts.history) ? opts.history.length : null,
   })
   return { proc, history: opts.history }
 }
@@ -3511,7 +3311,6 @@ async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn 
   proc.retiring = true
   proc.historyInvalid = true
   dropFromPool(proc)
-  unpark(proc.convKey)
   turn.fail(new Error(note))
   proc.abandonTurn(turn)
   let timer
@@ -3726,28 +3525,6 @@ function stripVolatileSystem(text) {
 
 function instructionsIdentity(text) {
   return compactIdentity(stripVolatileSystem(text))
-}
-
-// sentInstructionsIdentity is the instructions as agy was handed them
-// (outgoing: the lines Antigravity turns away reworded), as a parked
-// session is keyed. A session agy opened with a line a later version
-// rewords keeps that line in its own copy, and every turn on it is turned
-// away, so when the rewording changes, the session is not resumed and a
-// new one is opened with the instructions as they go now (#1151).
-// USER_CLOAK marks a session parked since its prompts went as cloakUser
-// says. One parked before keeps a user's turn with Codex's GPT-5 line as
-// written in agy's own copy, and every turn on it would be turned away, so
-// it is not resumed: a new session gets the history as it goes now.
-const USER_CLOAK = 1
-// A parked entry's instructionsInSession says where its instructions went.
-// A session agy opened with them appended keeps them in its own system
-// instruction, so every turn on it is turned away as before; it is resumed
-// only while they still go there (AGY_BRIDGE_SYSTEM_APPEND=1). One parked
-// before the field was written is not resumed: a new session gets them in
-// its first turn.
-
-function sentInstructionsIdentity(text) {
-  return compactIdentity(outgoing(stripVolatileSystem(text)))
 }
 
 // Message text used for conversation/history identity: billing header lines,
@@ -4024,9 +3801,7 @@ function findLiveContinuedProc(opts) {
 
 function rekeyProc(proc, newKey) {
   if (!proc || proc.convKey === newKey) return proc
-  const oldKey = proc.convKey
   dropFromPool(proc)
-  unpark(oldKey)
   proc.convKey = newKey
   pool.set(newKey, proc)
   return proc
@@ -5856,6 +5631,13 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         blockIndex++
         responseContent.push({ type: "tool_use", id: call.id, name: call.name, input: call.arguments })
       }
+      // One request, one agy process: the process is stopped as soon as this
+      // response ends, whether it ended with an answer, a tool call, an error
+      // or a client abort. The next request replays its history in a new one.
+      const release = () => {
+        dropFromPool(proc)
+        proc.stop().catch(() => {})
+      }
       const detach = () => {
         finished = true
         turn.detach()
@@ -5881,11 +5663,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       const abort = () => {
         if (finished) return
         detach()
-        if (!proc.cancelTurn(turn, partial())) {
-          dropFromPool(proc)
-          proc.abandonTurn(turn)
-          proc.stop().catch(() => {})
-        }
+        if (!proc.cancelTurn(turn, partial())) proc.abandonTurn(turn)
+        release()
         try { controller.error(signal?.reason || new Error("request aborted")) } catch {}
       }
       abortHandler = abort
@@ -5953,7 +5732,11 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             if (finished) return
             stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
+            // The client runs the tools and sends their results in its next
+            // request, which starts a fresh session with this history.
+            proc.finalizeTurn(turn)
             detach()
+            release()
             controller.close()
             return
           }
@@ -5966,19 +5749,17 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)
             detach()
+            release()
             controller.close()
             return
           }
           if (event.type === "error") {
             closeBlock()
             send("error", { type: "error", error: streamErrorOf(event.error) })
-            if (!event.error?.keepProcess) {
-              dropFromPool(proc)
-              await proc.stop().catch(() => {})
-            }
             if (finished) return
             proc.finalizeTurn(turn)
             detach()
+            release()
             controller.close()
             return
           }
@@ -6167,22 +5948,7 @@ function streamResponse(proc, turn, body, signal) {
   })
 }
 
-// Tool results a kept session already holds (answered to its live MCP calls
-// when the user steered) are not sent again in the steer's prompt.
-// An answered result's images are the exception: the call got its text only
-// (textOnlyResult), so its images go in the prompt, under the result's id.
-function withoutAnswered(messages, answered) {
-  if (!answered?.size) return messages
-  return messages.map((message) => message.role === "user" && Array.isArray(message.content)
-    ? { ...message, content: message.content.flatMap((block) => {
-      if (!(block?.type === "tool_result" && answered.has(block.tool_use_id))) return [block]
-      const images = Array.isArray(block.content) ? block.content.filter((part) => part?.type === "image") : []
-      return images.length ? [{ ...block, content: images }] : []
-    }) }
-    : message)
-}
-
-async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered) {
+async function beginTurn(proc, history, body, callerWorkDir, model, selection) {
   const reminder = outputFormatReminder(body)
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
@@ -6190,7 +5956,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
   const baseParts = !isFirstTurn
     ? renderContinuedTurnParts(flattened
       ? [flattened, ...body.messages.slice(1)]
-      : withoutAnswered(body.messages.slice(history.length), answered))
+      : body.messages.slice(history.length))
     : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession,
       reminder.length ? promptTextBytes(reminder) + 2 : 0)
   const contentParts = mergePromptParts(baseParts, reminder)
@@ -6494,137 +6260,20 @@ export const AntigravityBridgePlugin = async () => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
-                hasToolResults: resultBlocks.length > 0, userId: body.metadata?.user_id || "" }
-              let answeredIds = null
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds)
-              let keptSession = false
-              if (resultBlocks.length) {
-                const matches = matchToolResults(body, resultBlocks)
-                const found = matches.filter((item) => item.match)
-                if (found.length) {
-                  if (found.length !== matches.length) {
-                    return jsonError(409, "agy bridge: some tool results do not belong to the active response")
-                  }
-                  const proc = found[0].match.proc
-                  const turn = found[0].match.turn
-                  if (found.some((item) => item.match.proc !== proc || item.match.turn !== turn)) {
-                    return jsonError(409, "agy bridge: tool results from different conversations cannot be combined")
-                  }
-                  if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
-                  if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
-                  if (turn.steering) throw new BusyError("agy bridge: this conversation is already steering this tool turn")
-                  noProgressRepeats.delete(convKey) // matched results are real progress
-                  const rawResults = matches.map(({ block, match }) => ({
-                    block,
-                    call: match.call,
-                    result: toolResult(block),
-                  }))
-                  proc.validateResults(rawResults)
-                  let interrupted = isInterruptedToolTurn(body)
-                  let results = rawResults
-                  if (!interrupted) {
-                    try {
-                      const inspected = inspectToolTurn(rawResults, body)
-                      results = inspected.results
-                      if (inspected.userSteered) interrupted = true
-                    } catch (error) {
-                      if (error instanceof UnsupportedContent && canReplayFollowUpAfterResults(body, rawResults)) {
-                        interrupted = true
-                      } else {
-                        throw error
-                      }
-                    }
-                  }
-                  if (!interrupted) proc.validateResults(results)
-                  // An image over MCP reaches agy's model as a path it can't
-                  // read, so a result with one takes the steer's way: the call
-                  // gets the text, the next prompt the image.
-                  const imageResult = proc.supportsImages && results.some((item) => resultHasImage(item.result))
-                  const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
-                  const historyMatches = directIdsMatch
-                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
-                    : proc.matchesHistory(trailingMessages(body).history)
-                  // A steer keeps the live session, so agy's prompt cache holds: the
-                  // calls are answered with their real results, the step is
-                  // cancelled, and the steer goes in as the next prompt.
-                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
-                    sameInstructions(proc.instructions, instructions) &&
-                    await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
-                    keptSession = true
-                    answeredIds = new Set(
-                      rawResults
-                        .filter((item) => !item.call.deferred || item.call.lateDelivered)
-                        .map((item) => item.block.tool_use_id),
-                    )
-                  } else if (interrupted || imageResult || !historyMatches || proc.toolsGrew(tools) ||
-                    proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
-                    // A changed context, a tool catalog that grew, or a
-                    // user-interrupted tool turn needs a new session. Replay the
-                    // real results without resolving the old process's calls.
-                    dropFromPool(proc)
-                    proc.abandonTurn(turn)
-                    await proc.stop()
-                  } else {
-                    if (!proc.dead && !turn.done) {
-                      // A tool catalog that lost or changed tools applies to the
-                      // rest of this turn; a model change applies from the next prompt.
-                      await proc.updateTools(tools)
-                      proc.continueWith(results)
-                      proc.recordToolResults(turn, body.messages)
-                    }
-                    return streamResponse(proc, turn, body, init.signal)
-                  }
-                }
-                const held = pool.get(convKey)
-                if (held?.turn && !held.turn.cancelRequested) {
-                  const verdict = movedOnVerdict(held.turn, body.messages) ?? staleTurnVerdict(held, held.turn)
-                  let attempts
-                  if (!verdict.stale) {
-                    // An attached stream is live progress; only a quiet turn counts.
-                    if (verdict.reason === "attached" || verdict.reason === "steering") noProgressRepeats.delete(convKey)
-                    else attempts = noteNoProgressRepeat(convKey, held.turn)
-                    if (attempts == null || attempts < NO_PROGRESS_REPEAT_LIMIT) {
-                      logBridgeEvent(held, held.turn, "reject_active", verdict.reason, acquireOpts,
-                        attempts != null ? { attempts } : {})
-                      return jsonError(409, "agy bridge: no active MCP call matches these tool results")
-                    }
-                  }
-                  // The held turn can never progress again, or the same unmatched
-                  // results hit it too often without progress: reclaim it and
-                  // replay this request's own tool round once, under one lock.
-                  const recovery = await recoverStaleTurn({ agy, convKey, proc: held, turn: held.turn,
-                    body, resultBlocks, acquireOpts, isFresh, begin, attempts })
-                  if (recovery.kind === "replayed") return streamResponse(recovery.proc, recovery.turn, body, init.signal)
-                  if (recovery.kind === "active") {
-                    return jsonError(409, "agy bridge: no active MCP call matches these tool results")
-                  }
-                  if (recovery.kind === "conflict" || recovery.kind === "incomplete") {
-                    const code = recovery.kind === "conflict" ? "tool_state_conflict" : "tool_history_incomplete"
-                    const message = attempts != null
-                      ? `agy bridge: ${code}: these tool results matched no live call ${attempts} times without progress, and this conversation's tool state cannot be realigned. Stop resending them; restart from the last self-consistent user message.`
-                      : recovery.kind === "conflict"
-                        ? "agy bridge: this turn was already replaced. Stop resending this request."
-                        : "agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message."
-                    return jsonError(400, message, code, {
-                      noRetry: true,
-                      ...(attempts != null ? { extra: { attempts, turn_id: recovery.turnId } } : {}),
-                    })
-                  }
-                  // fallthrough: the turn went away or is being cancelled; take the normal path.
-                }
-                if (replayHistoryProblem(body, resultBlocks)) {
-                  throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
-                }
+                hasToolResults: resultBlocks.length > 0, userId: body.metadata?.user_id || "", signal: init.signal }
+              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection)
+              // Every request is a one-shot conversation: it opens an agy
+              // session of its own and the process is stopped when the response
+              // ends. A request carrying tool results is replayed as history
+              // like any other; it is never matched to a live turn of an
+              // earlier request, whose process is already gone.
+              if (resultBlocks.length && replayHistoryProblem(body, resultBlocks)) {
+                throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
               }
-
-              const { proc, turn } = await acquireProc(
-                agy,
-                convKey,
-                acquireOpts,
-                isFresh,
-                resultBlocks.length > 0 && !keptSession,
-                begin,
-              )
+              // One key per request, so a concurrent request with the same
+              // prompt opens its own session instead of joining this one.
+              const requestKey = `${convKey}#${reqId}`
+              const { proc, turn } = await acquireProc(agy, requestKey, acquireOpts, isFresh, true, begin)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })

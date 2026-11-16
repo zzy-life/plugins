@@ -199,8 +199,14 @@ test("Windows falls back to nc.cmd when the runtime can't build nc.exe", async (
 test("at exit on Windows every live agy's tree is ended and the workspaces removed; the shared nc.exe stays", async () => {
   const kit = await windowsKit()
   try {
-    await turn(kit, "one", workDir(kit, "w1"))
-    await turn(kit, "two", workDir(kit, "w2"))
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("partial")
+      await agent.waitCancel()
+      return { stopReason: "cancelled" }
+    }
+    const responses = await Promise.all([kit.request(body("one")), kit.request(body("two"))])
+    const readers = responses.map((response) => response.body.getReader())
+    await Promise.all(readers.map((reader) => reader.read()))
     const procs = [...kit.module.__agyTestAllProcs]
     assert.equal(procs.length, 2)
     procs.forEach((proc, index) => { proc.child.pid = 4100 + index })
